@@ -3,41 +3,38 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>MediaPipe Hands - Front Camera</title>
+  <title>MediaPipe Hands Console Only</title>
 
   <!-- MediaPipe dependencies -->
   <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js"></script>
 
   <style>
     body {
       margin: 0;
-      overflow: hidden;
+      background: black;
       display: flex;
       justify-content: center;
       align-items: center;
       height: 100vh;
-      background: black;
+      overflow: hidden;
     }
-    video, canvas {
-      position: absolute;
-      transform: scaleX(-1); /* mirror for selfie view */
+
+    video {
       width: 100vw;
       height: 100vh;
       object-fit: cover;
+      transform: scaleX(-1); /* Mirror for selfie view */
     }
   </style>
 </head>
 <body>
   <video id="input_video" autoplay playsinline muted></video>
-  <canvas id="output_canvas"></canvas>
 
   <script type="module">
     const videoElement = document.getElementById('input_video');
-    const canvasElement = document.getElementById('output_canvas');
-    const canvasCtx = canvasElement.getContext('2d');
 
+    // ✅ Request front camera
     async function setupCamera() {
       try {
         const stream = await navigator.mediaDevices.getUserMedia({
@@ -46,26 +43,13 @@
         });
         videoElement.srcObject = stream;
         await new Promise((resolve) => (videoElement.onloadedmetadata = resolve));
-        console.log("✅ Camera ready (front view)");
+        console.log("✅ Front camera initialized");
       } catch (err) {
         console.error("🚫 Camera access error:", err);
-        alert("Camera permission denied or unavailable.");
       }
     }
 
-    function onResults(results) {
-      canvasCtx.save();
-      canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
-      canvasCtx.drawImage(results.image, 0, 0, canvasElement.width, canvasElement.height);
-      if (results.multiHandLandmarks) {
-        for (const landmarks of results.multiHandLandmarks) {
-          drawConnectors(canvasCtx, landmarks, HAND_CONNECTIONS, { color: '#00FF00', lineWidth: 4 });
-          drawLandmarks(canvasCtx, landmarks, { color: '#FF0000', lineWidth: 2 });
-        }
-      }
-      canvasCtx.restore();
-    }
-
+    // ✅ MediaPipe Hands setup
     const hands = new Hands({
       locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`,
     });
@@ -77,8 +61,17 @@
       minTrackingConfidence: 0.7,
     });
 
-    hands.onResults(onResults);
+    // ✅ Log only landmarks (no drawing)
+    hands.onResults((results) => {
+      if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+        console.clear();
+        results.multiHandLandmarks.forEach((landmarks, i) => {
+          console.log(`✋ Hand ${i + 1}:`, landmarks);
+        });
+      }
+    });
 
+    // ✅ Initialize camera and start detection
     async function init() {
       await setupCamera();
       const camera = new Camera(videoElement, {
@@ -93,13 +86,13 @@
 
     init();
 
-    // Optional: send a message back to React Native (if loaded inside WebView)
+    // Optional: Notify React Native WebView (if applicable)
     function sendToReactNative(msg) {
       if (window.ReactNativeWebView) {
         window.ReactNativeWebView.postMessage(msg);
       }
     }
-    sendToReactNative("✅ MediaPipe Hands initialized.");
+    sendToReactNative("✅ MediaPipe Hands (console only) initialized.");
   </script>
 </body>
 </html>
