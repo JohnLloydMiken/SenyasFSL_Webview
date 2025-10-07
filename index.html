@@ -1,25 +1,20 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>SenyasFSL WebView Hands</title>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>SenyasFSL - MediaPipe Hands (improved)</title>
 
-  <!-- MediaPipe Dependencies -->
   <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
 
   <style>
-    body {
-      margin: 0;
-      background: black;
-      overflow: hidden;
-    }
+    html,body { height:100%; margin:0; background:black; }
     video {
-      width: 100vw;
-      height: 100vh;
-      object-fit: cover;
-      transform: scaleX(-1); /* Mirror for selfie */
+      width:100vw; height:100vh; object-fit:cover;
+      /* Mirror for selfie UI only — doesn't change underlying raw landmark numbers.
+         If you need mirrored coordinates for the model, use FLIP_X toggle below. */
+      transform: scaleX(-1);
     }
   </style>
 </head>
@@ -27,85 +22,176 @@
   <video id="input_video" autoplay playsinline muted></video>
 
   <script type="module">
+    /******************** CONFIG/TUNABLES ********************/
+    const BACKEND_URL = "http://192.168.0.106:8000/predict"; // <-- change to your backend IP:PORT
+    const SEQ_LENGTH = 30;                  // sequence length your model expects
+    const SAMPLE_INTERVAL_MS = 50;          // ~20 fps sampling (adjust as needed)
+    const PREDICT_THROTTLE_MS = 800;        // minimum time between backend requests
+    const SMOOTHING_ALPHA = 0.6;            // 0..1, larger -> more influence from current frame
+    const FLIP_X = true;                    // true => x := 1 - x (mirror coords to match training)
+    const USE_NORMALIZATION = false;        // true => center on wrist and scale (only if model trained on normalized coords)
+    const FILL_MISSING_WITH_LAST = true;    // if no detection, use last known frame (better than zeros)
+    /*********************************************************/
+
     const videoElement = document.getElementById('input_video');
-    const SEQ_LENGTH = 30;
-    let sequence = [];
-    let lastSent = 0;
+
+    let sequence = [];              // sliding window of frames (each frame = 63 numbers)
+    let lastSampleTs = 0;
+    let lastSentTs = 0;
+    let prevSmoothed = null;        // for exponential smoothing (array of 63)
+    let cameraInstance = null;
 
     async function setupCamera() {
       try {
         const stream = await navigator.mediaDevices.getUserMedia({
           video: { facingMode: 'user', width: 640, height: 480 },
-          audio: false,
+          audio: false
         });
         videoElement.srcObject = stream;
-        await new Promise((resolve) => (videoElement.onloadedmetadata = resolve));
-        console.log("✅ Front camera ready");
-        sendToReactNative("✅ Front camera initialized");
+        await new Promise(resolve => (videoElement.onloadedmetadata = resolve));
+        console.log("✅ Camera ready");
+        sendToReactNative("✅ Camera ready");
       } catch (err) {
-        console.error("🚫 Camera access error:", err);
-        sendToReactNative("🚫 Camera access error: " + err.message);
+        console.error("Camera error:", err);
+        sendToReactNative("🚫 Camera error: " + (err && err.message ? err.message : err));
       }
     }
 
-    // Setup MediaPipe Hands
+    // Helper: convert landmarks array-of-points -> flat [x,y,z,...]
+    function flattenLandmarks(pts) {
+      return pts.flatMap(p => [p.x, p.y, p.z]);
+    }
+
+    // Helper: flip X coordinates (x := 1 - x)
+    function maybeFlipX(arr) {
+      if (!FLIP_X) return arr;
+      const out = arr.slice();
+      for (let i = 0; i < out.length; i += 3) {
+        out[i] = 1 - out[i]; // x
+      }
+      return out;
+    }
+
+    // Helper: exponential smoothing
+    function smooth(arr) {
+      if (!prevSmoothed) {
+        prevSmoothed = arr.slice();
+        return prevSmoothed.slice();
+      }
+      for (let i = 0; i < arr.length; ++i) {
+        prevSmoothed[i] = SMOOTHING_ALPHA * arr[i] + (1 - SMOOTHING_ALPHA) * prevSmoothed[i];
+      }
+      return prevSmoothed.slice();
+    }
+
+    // Optional normalization: center on wrist (landmark 0) and scale by max distance or wrist->index_mcp
+    function normalizeCenterScale(arr) {
+      // arr is flat [x,y,z,...] length 63
+      const pts = [];
+      for (let i = 0; i < arr.length; i += 3) pts.push([arr[i], arr[i+1], arr[i+2]]);
+      const wrist = pts[0];
+      // compute scale reference (distance wrist -> index_mcp (landmark 5))
+      const ref = pts[5] || [0.1, 0.1, 0.0]; // guard
+      const dx = ref[0] - wrist[0];
+      const dy = ref[1] - wrist[1];
+      const baseDist = Math.sqrt(dx*dx + dy*dy) || 1.0;
+      const out = [];
+      for (let i = 0; i < pts.length; ++i) {
+        out.push((pts[i][0] - wrist[0]) / baseDist);
+        out.push((pts[i][1] - wrist[1]) / baseDist);
+        out.push((pts[i][2] - wrist[2]) / baseDist);
+      }
+      return out;
+    }
+
+    // When we don't detect a hand, prefer repeating last smoothed frame (if allowed)
+    function produceMissingFrame() {
+      if (FILL_MISSING_WITH_LAST && prevSmoothed) return prevSmoothed.slice();
+      return new Array(63).fill(0);
+    }
+
+    // Send sequence to backend (sequence is array of 30 frames of length 63)
+    async function sendSequenceToBackend(seq) {
+      try {
+        const res = await fetch(BACKEND_URL, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ sequence: seq })
+        });
+        const data = await res.json();
+        console.log("🧠 Prediction from backend:", data);
+        sendToReactNative(JSON.stringify(data));
+      } catch (err) {
+        console.error("Prediction error:", err);
+        sendToReactNative("❌ Prediction error: " + (err && err.message ? err.message : err));
+      }
+    }
+
+    // MediaPipe Hands setup
     const hands = new Hands({
-      locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`,
+      locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
     });
 
     hands.setOptions({
       maxNumHands: 1,
       modelComplexity: 1,
-      minDetectionConfidence: 0.7,
-      minTrackingConfidence: 0.7,
+      minDetectionConfidence: 0.75,
+      minTrackingConfidence: 0.75
     });
 
-    hands.onResults(async (results) => {
-      if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
-        const landmarks = results.multiHandLandmarks[0].flatMap(pt => [pt.x, pt.y, pt.z]);
-        sequence.push(landmarks);
-        if (sequence.length > SEQ_LENGTH) sequence.shift();
+    hands.onResults((results) => {
+      const now = Date.now();
+      // sample at configured interval (keeps sampling consistent)
+      if (now - lastSampleTs < SAMPLE_INTERVAL_MS) {
+        return;
+      }
+      lastSampleTs = now;
 
-        const now = Date.now();
-        if (sequence.length === SEQ_LENGTH && now - lastSent > 1000) {
-          lastSent = now;
-          try {
-            const res = await fetch("http://192.168.0.106:8000/predict", {  // 👈 CHANGE THIS TO YOUR BACKEND IP
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ sequence }),
-            });
-            const data = await res.json();
-            console.log("🧠 Prediction:", data);
-            sendToReactNative(JSON.stringify(data));
-          } catch (err) {
-            console.error("❌ Prediction error:", err);
-            sendToReactNative("❌ Prediction error: " + err.message);
-          }
-        }
+      let frameFlat;
+      if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+        frameFlat = flattenLandmarks(results.multiHandLandmarks[0]);
+        // optionally flip X, then smooth, then normalize
+        frameFlat = maybeFlipX(frameFlat);
+        if (SMOOTHING_ALPHA < 1) frameFlat = smooth(frameFlat);
+        if (USE_NORMALIZATION) frameFlat = normalizeCenterScale(frameFlat);
+      } else {
+        // no detection - fill missing frame
+        frameFlat = produceMissingFrame();
+      }
+
+      // push into sliding window
+      sequence.push(frameFlat);
+      if (sequence.length > SEQ_LENGTH) sequence.shift();
+
+      // only call backend when we have full sequence and throttle predictions
+      if (sequence.length === SEQ_LENGTH && now - lastSentTs > PREDICT_THROTTLE_MS) {
+        lastSentTs = now;
+        // send a deep copy to avoid mutation while request is in flight
+        const seqToSend = sequence.map(arr => arr.slice());
+        sendSequenceToBackend(seqToSend);
       }
     });
 
     async function init() {
       await setupCamera();
-      const camera = new Camera(videoElement, {
+      cameraInstance = new Camera(videoElement, {
         onFrame: async () => {
           await hands.send({ image: videoElement });
         },
         width: 640,
-        height: 480,
+        height: 480
       });
-      camera.start();
+      cameraInstance.start();
     }
 
     init();
 
-    // Send messages to React Native
+    // Bridge to React Native when available; otherwise console.log
     function sendToReactNative(msg) {
-      if (window.ReactNativeWebView) {
+      if (window.ReactNativeWebView && window.ReactNativeWebView.postMessage) {
         window.ReactNativeWebView.postMessage(msg);
       } else {
-        console.log("ℹ️ RN bridge not available:", msg);
+        console.log("RNbridge:", msg);
       }
     }
   </script>
