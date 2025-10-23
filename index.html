@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>SenyasFSL - MediaPipe Hands (updated)</title>
+  <title>SenyasFSL - Hands Recognizer</title>
 
   <!-- MediaPipe dependencies -->
   <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
@@ -11,15 +11,15 @@
 
   <style>
     html, body {
-      height: 100%;
       margin: 0;
       background: black;
+      height: 100%;
     }
     video {
       width: 100vw;
       height: 100vh;
       object-fit: cover;
-      transform: scaleX(-1); /* mirror for selfie view */
+      transform: scaleX(-1);
     }
   </style>
 </head>
@@ -28,117 +28,86 @@
 
   <script type="module">
     /******************** CONFIGURATION ********************/
-    const BACKEND_URL = "https://senyasfsl-api-tw67.onrender.com/predict/letters"; // Render backend endpoint
-    const SEQ_LENGTH = 30;                   // number of frames per prediction
-    const SAMPLE_INTERVAL_MS = 50;           // ~20 FPS sampling
-    const PREDICT_THROTTLE_MS = 800;         // minimum time between predictions
-    const SMOOTHING_ALPHA = 0.6;             // exponential smoothing factor
-    const FLIP_X = true;                     // mirror X coordinates if needed
-    const USE_NORMALIZATION = false;         // set true if model trained on normalized coords
-    const FILL_MISSING_WITH_LAST = true;     // reuse last frame if detection missing
+    const SEQ_LENGTH = 30;
+    const SAMPLE_INTERVAL_MS = 50;
+    const PREDICT_THROTTLE_MS = 800;
+    const SMOOTHING_ALPHA = 0.6;
+    const FLIP_X = true;
+
+    // 🧠 Configurable via injected JS from React Native
+    const HAND_MODE = window.HAND_MODE || "one";   // "one" or "two"
+    const MODEL_NAME = window.MODEL_NAME || "letters";
+    const BACKEND_URL = `https://senyasfsl-api-tw67.onrender.com/predict/${MODEL_NAME}`;
     /*********************************************************/
 
-    const videoElement = document.getElementById('input_video');
+    const videoElement = document.getElementById("input_video");
 
-    let sequence = [];              // buffer of frames
+    let seqRight = [];
+    let seqLeft = [];
     let lastSampleTs = 0;
     let lastSentTs = 0;
-    let prevSmoothed = null;        // smoothing memory
     let cameraInstance = null;
+    let prevSmoothR = null, prevSmoothL = null;
 
-    // === CAMERA SETUP ===
     async function setupCamera() {
       try {
         const stream = await navigator.mediaDevices.getUserMedia({
-          video: { facingMode: 'user', width: 640, height: 480 },
-          audio: false
+          video: { facingMode: "user", width: 640, height: 480 },
+          audio: false,
         });
         videoElement.srcObject = stream;
-        await new Promise(resolve => (videoElement.onloadedmetadata = resolve));
-        console.log("✅ Camera ready");
+        await new Promise((res) => (videoElement.onloadedmetadata = res));
         sendToReactNative("✅ Camera ready");
       } catch (err) {
-        console.error("Camera error:", err);
-        sendToReactNative("🚫 Camera error: " + (err && err.message ? err.message : err));
+        sendToReactNative("🚫 Camera error: " + err.message);
       }
     }
 
-    // === LANDMARK UTILITIES ===
-    function flattenLandmarks(pts) {
-      return pts.flatMap(p => [p.x, p.y, p.z]);
-    }
-
-    function maybeFlipX(arr) {
+    // ======== UTILITIES ========
+    const flatten = (pts) => pts.flatMap(p => [p.x, p.y, p.z]);
+    const maybeFlip = (arr) => {
       if (!FLIP_X) return arr;
       const out = arr.slice();
-      for (let i = 0; i < out.length; i += 3) {
-        out[i] = 1 - out[i]; // flip x
-      }
+      for (let i = 0; i < out.length; i += 3) out[i] = 1 - out[i];
       return out;
-    }
+    };
+    const smooth = (arr, prevRef) => {
+      if (!prevRef.value) { prevRef.value = arr.slice(); return arr; }
+      for (let i = 0; i < arr.length; ++i)
+        prevRef.value[i] = SMOOTHING_ALPHA * arr[i] + (1 - SMOOTHING_ALPHA) * prevRef.value[i];
+      return prevRef.value.slice();
+    };
+    const zeroFrame = (n = 63) => new Array(n).fill(0);
 
-    function smooth(arr) {
-      if (!prevSmoothed) {
-        prevSmoothed = arr.slice();
-        return prevSmoothed.slice();
-      }
-      for (let i = 0; i < arr.length; ++i) {
-        prevSmoothed[i] = SMOOTHING_ALPHA * arr[i] + (1 - SMOOTHING_ALPHA) * prevSmoothed[i];
-      }
-      return prevSmoothed.slice();
-    }
+    async function sendToBackend() {
+      const body =
+        HAND_MODE === "two"
+          ? { right_hand: seqRight, left_hand: seqLeft, sequence_length: SEQ_LENGTH }
+          : { right_hand: seqRight, sequence_length: SEQ_LENGTH };
 
-    function normalizeCenterScale(arr) {
-      const pts = [];
-      for (let i = 0; i < arr.length; i += 3)
-        pts.push([arr[i], arr[i+1], arr[i+2]]);
-      const wrist = pts[0];
-      const ref = pts[5] || [0.1, 0.1, 0.0];
-      const dx = ref[0] - wrist[0];
-      const dy = ref[1] - wrist[1];
-      const baseDist = Math.sqrt(dx*dx + dy*dy) || 1.0;
-      const out = [];
-      for (let i = 0; i < pts.length; ++i) {
-        out.push((pts[i][0] - wrist[0]) / baseDist);
-        out.push((pts[i][1] - wrist[1]) / baseDist);
-        out.push((pts[i][2] - wrist[2]) / baseDist);
-      }
-      return out;
-    }
-
-    function produceMissingFrame() {
-      if (FILL_MISSING_WITH_LAST && prevSmoothed) return prevSmoothed.slice();
-      return new Array(63).fill(0);
-    }
-
-    // === SEND SEQUENCE TO BACKEND ===
-    async function sendSequenceToBackend(seq) {
       try {
         const res = await fetch(BACKEND_URL, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            right_hand: seq,          // ✅ FastAPI expects this key
-            sequence_length: SEQ_LENGTH
-          }),
+          body: JSON.stringify(body),
         });
 
         const data = await res.json();
-        console.log("🧠 Prediction from backend:", data);
+        console.log("🧠 Prediction:", data);
         sendToReactNative(JSON.stringify(data));
       } catch (err) {
-        console.error("Prediction error:", err);
-        sendToReactNative("❌ Prediction error: " + (err && err.message ? err.message : err));
+        sendToReactNative("❌ Prediction error: " + err.message);
       }
     }
 
-    // === MEDIAPIPE HANDS SETUP ===
+    // ======== MEDIAPIPE HANDS ========
     const hands = new Hands({
-      locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`,
+      locateFile: (file) =>
+        `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`,
     });
 
     hands.setOptions({
-      maxNumHands: 1,
+      maxNumHands: HAND_MODE === "two" ? 2 : 1,
       modelComplexity: 1,
       minDetectionConfidence: 0.5,
       minTrackingConfidence: 0.5,
@@ -149,33 +118,36 @@
       if (now - lastSampleTs < SAMPLE_INTERVAL_MS) return;
       lastSampleTs = now;
 
-      let frameFlat;
-      if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
-        frameFlat = flattenLandmarks(results.multiHandLandmarks[0]);
-        frameFlat = maybeFlipX(frameFlat);
-        if (SMOOTHING_ALPHA < 1) frameFlat = smooth(frameFlat);
-        if (USE_NORMALIZATION) frameFlat = normalizeCenterScale(frameFlat);
-      } else {
-        frameFlat = produceMissingFrame();
+      let right = null,
+        left = null;
+
+      if (results.multiHandLandmarks && results.multiHandedness) {
+        results.multiHandLandmarks.forEach((lm, i) => {
+          const handType = results.multiHandedness[i].label;
+          const flat = maybeFlip(flatten(lm));
+          if (handType === "Right") right = smooth(flat, { value: prevSmoothR });
+          if (handType === "Left") left = smooth(flat, { value: prevSmoothL });
+        });
       }
 
-      sequence.push(frameFlat);
-      if (sequence.length > SEQ_LENGTH) sequence.shift();
+      if (!right) right = prevSmoothR || zeroFrame();
+      if (!left) left = prevSmoothL || zeroFrame();
 
-      if (sequence.length === SEQ_LENGTH && now - lastSentTs > PREDICT_THROTTLE_MS) {
+      seqRight.push(right);
+      seqLeft.push(left);
+      if (seqRight.length > SEQ_LENGTH) seqRight.shift();
+      if (seqLeft.length > SEQ_LENGTH) seqLeft.shift();
+
+      if (seqRight.length === SEQ_LENGTH && now - lastSentTs > PREDICT_THROTTLE_MS) {
         lastSentTs = now;
-        const seqToSend = sequence.map(arr => arr.slice());
-        sendSequenceToBackend(seqToSend);
+        sendToBackend();
       }
     });
 
-    // === INITIALIZATION ===
     async function init() {
       await setupCamera();
       cameraInstance = new Camera(videoElement, {
-        onFrame: async () => {
-          await hands.send({ image: videoElement });
-        },
+        onFrame: async () => await hands.send({ image: videoElement }),
         width: 640,
         height: 480,
       });
@@ -184,13 +156,10 @@
 
     init();
 
-    // === BRIDGE TO REACT NATIVE ===
     function sendToReactNative(msg) {
-      if (window.ReactNativeWebView && window.ReactNativeWebView.postMessage) {
+      if (window.ReactNativeWebView?.postMessage)
         window.ReactNativeWebView.postMessage(msg);
-      } else {
-        console.log("RNbridge:", msg);
-      }
+      else console.log("RNBridge:", msg);
     }
   </script>
 </body>
