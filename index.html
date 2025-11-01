@@ -34,10 +34,15 @@
     const SMOOTHING_ALPHA = 0.6;
     const FLIP_X = true;
 
-    // 🧠 Configurable via injected JS from React Native
-    const HAND_MODE = window.HAND_MODE || "one";   // "one" or "two"
-    const MODEL_NAME = window.MODEL_NAME || "letters";
+    // ✅ Parse model and hand mode from query params
+    const params = new URLSearchParams(window.location.search);
+    const MODEL_NAME = params.get("model") || "letters";
+    const HAND_MODE = params.get("hand") || "one";
     const BACKEND_URL = `https://senyasfsl-api-tw67.onrender.com/predict/${MODEL_NAME}`;
+
+    console.log("🌐 Using model:", MODEL_NAME, "| Hand mode:", HAND_MODE);
+    sendToReactNative(`🌐 Using model: ${MODEL_NAME}, Hand mode: ${HAND_MODE}`);
+
     /*********************************************************/
 
     const videoElement = document.getElementById("input_video");
@@ -46,7 +51,6 @@
     let seqLeft = [];
     let lastSampleTs = 0;
     let lastSentTs = 0;
-    let cameraInstance = null;
     let prevSmoothR = null, prevSmoothL = null;
 
     async function setupCamera() {
@@ -146,12 +150,12 @@
 
     async function init() {
       await setupCamera();
-      cameraInstance = new Camera(videoElement, {
+      const camera = new Camera(videoElement, {
         onFrame: async () => await hands.send({ image: videoElement }),
         width: 640,
         height: 480,
       });
-      cameraInstance.start();
+      camera.start();
     }
 
     init();
